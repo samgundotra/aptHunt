@@ -1,4 +1,4 @@
-# aptHunt
+# aptHunt 🏙️
 
 A Python script that automatically tracks NYC apartment listings from an iMessage group chat and syncs them to a color-coded Google Sheet — updated every 2 hours via macOS launchd.
 
@@ -25,7 +25,7 @@ Status column uses a pastel color palette with dropdown validation:
 - `Toured` — sage
 - `Off Market` / `Rejected` / `Passed` — lavender
 
-## Tech stack
+## Tech stack 🛠️
 
 | Layer | Tool |
 |---|---|
@@ -47,7 +47,7 @@ python3 -m venv .venv
 .venv/bin/pip install gspread google-auth google-auth-oauthlib google-api-python-client
 ```
 
-### 2. Google Sheets service account
+### 2. Google Sheets service account 📊
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com) → Create a project
 2. Enable the **Google Sheets API** and **Google Drive API**
@@ -74,7 +74,7 @@ ROOMMATE_2_HANDLE = "+1XXXXXXXXXX"
 sqlite3 ~/Library/Messages/chat.db "SELECT chat_id, display_name FROM chat_message_join JOIN chat USING(chat_id) LIMIT 50;"
 ```
 
-### 4. Grant Full Disk Access to Python
+### 4. Grant Full Disk Access to Python 🔐
 
 macOS blocks access to `chat.db` by default. Grant FDA to the Python binary:
 
@@ -84,7 +84,7 @@ macOS blocks access to `chat.db` by default. Grant FDA to the Python binary:
    /path/to/aptHunt/.venv/bin/python
    ```
 
-### 5. Gmail (optional)
+### 5. Gmail (optional) 📬
 
 1. In Google Cloud Console, create an **OAuth 2.0 Client ID** (Desktop application)
 2. Download the JSON → save as `gmail_oauth_creds.json` in the project folder
@@ -100,7 +100,7 @@ macOS blocks access to `chat.db` by default. Grant FDA to the Python binary:
 .venv/bin/python apthunt.py --backfill   # re-fetch missing listing details
 ```
 
-### 7. Schedule with launchd (runs every 2 hours)
+### 7. Schedule with launchd ⏰
 
 Create `~/Library/LaunchAgents/com.yourname.apthunt.plist`:
 
@@ -137,7 +137,7 @@ launchctl load ~/Library/LaunchAgents/com.yourname.apthunt.plist
 
 > **Note:** The agent runs while your Mac is awake. It survives sleep — macOS fires it on wake if a scheduled run was missed.
 
-## How status detection works
+## How status detection works 🔍
 
 **iMessage threads** — when a listing URL is replied to in the group chat, the script reads the `thread_originator_guid` field in `chat.db` to find all replies. It keyword-matches reply text (e.g. "toured this", "requested a tour") and upgrades the status. Status only ever goes *up* — `Toured` and `Passed` are never auto-overwritten.
 
@@ -145,7 +145,7 @@ launchctl load ~/Library/LaunchAgents/com.yourname.apthunt.plist
 
 **StreetEasy availability** — checks `schema.org/OutOfStock` in the HTML to detect in-contract or rented listings. Rate-limited to 3 listings per run with a 24-hour cooldown per listing.
 
-## Files
+## Files 📁
 
 ```
 aptHunt/
