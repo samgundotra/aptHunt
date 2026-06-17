@@ -1,0 +1,16 @@
+# Google credentials — never commit these
+service_account.json
+gmail_oauth_creds.json
+gmail_token.json
+
+# Runtime state (contains your personal listing IDs)
+state.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+apthunt.log
