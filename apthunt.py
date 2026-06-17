@@ -63,7 +63,7 @@ TAPBACK    = {2000: "❤️", 2001: "👍", 2002: "👎", 2003: "😂", 2004: "�
 SE_RE      = re.compile(r'https?://streeteasy\.com/(?:rental|building|for-sale)/(\d+)', re.I)
 STATUS_RANK = {
     "Available": 0, "Tour Requested": 1, "Tour Scheduled": 2, "Toured": 3,
-    "Off Market": 10,  # auto-detected from StreetEasy (in contract / rented / expired)
+    "Off Market": 10,  # auto-detected via StreetEasy notification emails
     "Rejected": 99, "Passed": 99,  # terminal — never overwrite automatically
 }
 
@@ -235,6 +235,68 @@ def _addr_in(addr, text):
     return all(t in nt for t in tokens)
 
 
+def scan_gmail_off_market(gmail_svc, listing_addrs):
+    """
+    Scan StreetEasy notification emails for listings that went off market.
+
+    StreetEasy sends emails from *@streeteasy.com when a saved/inquired listing
+    is rented or taken off market. Match by listing ID embedded in the URL first
+    (most reliable), then fall back to address matching.
+    Returns a set of listing IDs confirmed off-market.
+    """
+    if gmail_svc is None:
+        return set()
+
+    off_market_ids = set()
+    queries = [
+        'from:(streeteasy.com) "no longer available" newer_than:90d',
+        'from:(streeteasy.com) "no longer on the market" newer_than:90d',
+        'from:(streeteasy.com) "has been rented" newer_than:90d',
+    ]
+    seen = set()
+
+    for q in queries:
+        try:
+            res = gmail_svc.users().threads().list(userId='me', q=q, maxResults=50).execute()
+        except Exception as e:
+            print(f"  Gmail off-market query failed: {e}")
+            continue
+
+        for t in res.get('threads', []):
+            if t['id'] in seen:
+                continue
+            seen.add(t['id'])
+            try:
+                thread = gmail_svc.users().threads().get(
+                    userId='me', id=t['id'], format='full'
+                ).execute()
+            except Exception:
+                continue
+
+            for m in thread['messages']:
+                subject = ''
+                for h in m['payload'].get('headers', []):
+                    if h['name'] == 'Subject':
+                        subject = h['value']
+                body = _gmail_text(m['payload'])
+                full_text = subject + ' ' + body
+
+                # Match by listing ID in StreetEasy URL (most reliable)
+                matched_by_url = False
+                for lid in SE_RE.findall(full_text):
+                    if lid in listing_addrs:
+                        off_market_ids.add(lid)
+                        matched_by_url = True
+
+                # Fall back to address matching
+                if not matched_by_url:
+                    for lid, addr in listing_addrs.items():
+                        if _addr_in(addr, full_text):
+                            off_market_ids.add(lid)
+
+    return off_market_ids
+
+
 def scan_gmail_tours(gmail_svc, listing_addrs):
     """
     Scan Gmail for broker tour signals.
@@ -397,12 +459,8 @@ def fetch_listing(listing_id):
     if not bm: bm = re.search(r'\b([1-9])\s*-\s*[Bb]edroom', html)
     if bm: beds = int(bm.group(1))
 
-    # Availability: schema.org/OutOfStock covers in-contract, rented, expired
-    off_market = bool(re.search(r'schema\.org/OutOfStock', html, re.I)
-                      or re.search(r'data-testid="availableStatus"', html))
-
     return {"address": address, "neighborhood": neighborhood, "borough": borough,
-            "price": price, "beds": beds, "off_market": off_market}
+            "price": price, "beds": beds}
 
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -660,41 +718,14 @@ def main():
             update_row(ws, row_num, new_status, "", "", "")
             updated += 1
 
-    # 5. Re-check StreetEasy availability (max 3 per run, 24h cooldown)
-    print("\nChecking StreetEasy availability...")
-    id_to_row   = id_row_map(ws)
-    status_col  = HEADERS.index("Status") + 1
-    status_vals = ws.col_values(status_col)
-    skip_statuses = {"Toured", "Off Market", "Rejected", "Passed"}
-    now_ts = datetime.now().isoformat()
-    checked = 0
-    for lid, info in state["listings"].items():
-        if checked >= 3: break
-        if lid not in id_to_row: continue
-        row_num = id_to_row[lid]
-        current = status_vals[row_num - 1] if row_num - 1 < len(status_vals) else ""
-        if current in skip_statuses: continue
-        last = info.get("last_avail_check", "")
-        if last and (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 86400:
-            continue
-        details = fetch_listing(lid)
-        info["last_avail_check"] = now_ts
-        checked += 1
-        if details.get("off_market"):
-            print(f"  {lid}: now Off Market")
-            ws.update_cell(row_num, status_col, "Off Market")
-            off_market_count += 1
-        elif details:
-            print(f"  {lid}: still active")
-        time.sleep(5)
-
-    # 6. Gmail: broker email signals
-    print("\nChecking Gmail for broker activity...")
+    # 5. Gmail: off-market notifications + broker email signals
+    print("\nChecking Gmail...")
     gmail_svc = get_gmail_service()
     if gmail_svc is None:
         if not GMAIL_CREDS.exists():
             print("  (Gmail not configured — run with --auth-gmail to set up)")
     else:
+        # Build {listing_id: address} map from current sheet state
         all_vals = ws.get_all_values()
         listing_addrs = {}
         for i, row in enumerate(all_vals):
@@ -704,6 +735,24 @@ def main():
             if lid and addr:
                 listing_addrs[lid] = addr
 
+        # Off-market detection via StreetEasy notification emails
+        skip_statuses = {"Toured", "Off Market", "Rejected", "Passed"}
+        id_to_row  = id_row_map(ws)
+        status_col = HEADERS.index("Status") + 1
+        status_vals_now = ws.col_values(status_col)
+        off_market_ids = scan_gmail_off_market(gmail_svc, listing_addrs)
+        for lid in off_market_ids:
+            if lid not in id_to_row: continue
+            row_num = id_to_row[lid]
+            current = status_vals_now[row_num - 1] if row_num - 1 < len(status_vals_now) else ""
+            if current in skip_statuses: continue
+            ws.update_cell(row_num, status_col, "Off Market")
+            print(f"  {lid}: Off Market [StreetEasy email]")
+            off_market_count += 1
+        if not off_market_ids:
+            print("  No off-market notifications found.")
+
+        # Broker tour signals
         gmail_updates = scan_gmail_tours(gmail_svc, listing_addrs)
         gmail_count = len(gmail_updates)
         if gmail_updates:
@@ -712,7 +761,7 @@ def main():
         else:
             print("  No new broker signals found.")
 
-    # 7. Append run summary to Run Log tab
+    # 6. Append run summary to Run Log tab
     log_run(ws.spreadsheet, added, updated, off_market_count, gmail_count, imessage_ok)
 
     save_state(state)
