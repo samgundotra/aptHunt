@@ -96,10 +96,12 @@ def scan_new_messages(last_rowid):
                    datetime(m.date/1000000000+978307200,"unixepoch","localtime")
             FROM message m
             JOIN chat_message_join cm ON m.ROWID = cm.message_id
-            WHERE cm.chat_id=? AND m.ROWID>? AND m.is_from_me=1
+            LEFT JOIN handle h ON m.handle_id = h.ROWID
+            WHERE cm.chat_id=? AND m.ROWID>?
+              AND (m.is_from_me=1 OR h.id IN (?, ?))
               AND m.text LIKE "%streeteasy%"
             ORDER BY m.date
-        ''', (CHAT_ID, last_rowid))
+        ''', (CHAT_ID, last_rowid, ROOMMATE_1_HANDLE, ROOMMATE_2_HANDLE))
         rows = cur.fetchall()
     except Exception as e:
         print(f"  ⚠  chat.db query failed ({e}) — Full Disk Access may be needed")
@@ -595,12 +597,12 @@ def main():
     added = updated = off_market_count = gmail_count = 0
     imessage_ok = True
 
-    # 1. iMessage: find new listing URLs
+    # 1. iMessage: find new listing URLs shared by anyone in the group
     raw = scan_new_messages(state["last_rowid"])
     if raw is None:
         raw = []
         imessage_ok = False
-    print(f"\nNew StreetEasy messages from you: {len(raw)}")
+    print(f"\nNew StreetEasy messages from group: {len(raw)}")
 
     new_items = []
     for rowid, guid, lid, sent_at in raw:
