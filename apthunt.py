@@ -30,8 +30,8 @@ SHEET_ID   = "YOUR_GOOGLE_SHEET_ID"
 CREDS_FILE = Path(__file__).parent / "service_account.json"
 STATE_FILE = Path(__file__).parent / "state.json"
 
-GMAIL_TOKEN  = Path(__file__).parent / "gmail_token.json"
-GMAIL_CREDS  = Path(__file__).parent / "gmail_oauth_creds.json"
+GMAIL_TOKEN = Path(__file__).parent / "gmail_token.json"
+GMAIL_CREDS = Path(__file__).parent / "gmail_oauth_creds.json"
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 YOUR_EMAIL   = "you@gmail.com"  # Used to skip your own sent messages when scanning Gmail
 
@@ -60,10 +60,10 @@ REQUESTED_KW = [
 ]
 
 TAPBACK    = {2000: "❤️", 2001: "👍", 2002: "👎", 2003: "😂", 2004: "‼️", 2005: "❓"}
-SE_RE      = re.compile(r'https?://streeteasy\.com/(?:rental|building|for-sale)/(\d+)', re.I)
+SE_RE      = re.compile(r'https?://streeteasy\.com/(?:rental|building|for-sale)/(\d+)(?=[?/\s]|$)', re.I)
 STATUS_RANK = {
     "Available": 0, "Tour Requested": 1, "Tour Scheduled": 2, "Toured": 3,
-    "Off Market": 10,  # auto-detected via StreetEasy notification emails
+    "Off Market": 10,  # auto-detected from StreetEasy (in contract / rented / expired)
     "Rejected": 99, "Passed": 99,  # terminal — never overwrite automatically
 }
 
@@ -92,14 +92,16 @@ def scan_new_messages(last_rowid):
     cur = conn.cursor()
     try:
         cur.execute('''
-            SELECT m.ROWID, m.guid, m.text,
+            SELECT m.ROWID, m.guid, m.text, m.payload_data,
                    datetime(m.date/1000000000+978307200,"unixepoch","localtime")
             FROM message m
             JOIN chat_message_join cm ON m.ROWID = cm.message_id
             LEFT JOIN handle h ON m.handle_id = h.ROWID
             WHERE cm.chat_id=? AND m.ROWID>?
               AND (m.is_from_me=1 OR h.id IN (?, ?))
-              AND m.text LIKE "%streeteasy%"
+              AND m.associated_message_type = 0
+              AND (m.text LIKE "%streeteasy%"
+                   OR (m.payload_data IS NOT NULL AND (m.text IS NULL OR m.text = "")))
             ORDER BY m.date
         ''', (CHAT_ID, last_rowid, ROOMMATE_1_HANDLE, ROOMMATE_2_HANDLE))
         rows = cur.fetchall()
@@ -109,9 +111,16 @@ def scan_new_messages(last_rowid):
         return []
     conn.close()
     results = []
-    for rowid, guid, text, sent_at in rows:
-        for lid in SE_RE.findall(text or ""):
-            results.append((rowid, guid, lid, sent_at))
+    seen_lids = set()
+    for rowid, guid, text, payload_data, sent_at in rows:
+        # Extract URLs from plain text and from payload_data blob (iOS rich-link shares)
+        combined = (text or "")
+        if payload_data:
+            combined += bytes(payload_data).decode("utf-8", errors="replace")
+        for lid in SE_RE.findall(combined):
+            if (rowid, lid) not in seen_lids:
+                seen_lids.add((rowid, lid))
+                results.append((rowid, guid, lid, sent_at))
     return results
 
 
@@ -144,7 +153,7 @@ def get_thread_data(guid):
     sam_items, r1_items, r2_items = [], [], []
     for tap_type, is_me, handle in tapbacks:
         emoji = TAPBACK.get(tap_type, "")
-        if is_me:                         sam_items.append(emoji)
+        if is_me:            sam_items.append(emoji)
         elif handle == ROOMMATE_1_HANDLE: r1_items.append(emoji)
         elif handle == ROOMMATE_2_HANDLE: r2_items.append(emoji)
 
@@ -153,7 +162,7 @@ def get_thread_data(guid):
         t = text.strip()
         if not t: continue
         all_text.append(t.lower())
-        if is_me:                         sam_items.append(t)
+        if is_me:            sam_items.append(t)
         elif handle == ROOMMATE_1_HANDLE: r1_items.append(t)
         elif handle == ROOMMATE_2_HANDLE: r2_items.append(t)
 
@@ -235,6 +244,103 @@ def _addr_in(addr, text):
     return all(t in nt for t in tokens)
 
 
+def scan_gmail_tours(gmail_svc, listing_addrs):
+    """
+    Scan Gmail for broker tour signals.
+
+    listing_addrs: {listing_id: address_string}
+    Returns: {listing_id: (status, broker_note)}
+    """
+    if gmail_svc is None:
+        return {}
+
+    updates = {}
+
+    # Query 1: StreetEasy inquiry threads (Sam sent tour request; broker may have replied)
+    queries = [
+        'subject:"StreetEasy Inquiry" newer_than:90d',
+        'subject:("limited tour windows" OR "schedule your tour") newer_than:90d',
+    ]
+    seen_thread_ids = set()
+
+    for q in queries:
+        try:
+            res = gmail_svc.users().threads().list(userId='me', q=q, maxResults=50).execute()
+        except Exception as e:
+            print(f"  Gmail query failed: {e}")
+            continue
+
+        for t in res.get('threads', []):
+            if t['id'] in seen_thread_ids:
+                continue
+            seen_thread_ids.add(t['id'])
+
+            try:
+                thread = gmail_svc.users().threads().get(
+                    userId='me', id=t['id'], format='full'
+                ).execute()
+            except Exception:
+                continue
+
+            msgs = thread['messages']
+
+            # Collect subject from any message
+            subject = ''
+            for m in msgs:
+                for h in m['payload'].get('headers', []):
+                    if h['name'] == 'Subject' and h['value']:
+                        subject = h['value']
+
+            # Find the most recent broker reply (skip Sam + StreetEasy noreply)
+            broker_body = ''
+            broker_sender = ''
+            for m in reversed(msgs):
+                hdrs = {h['name']: h['value'] for h in m['payload'].get('headers', [])}
+                sender = hdrs.get('From', '')
+                if YOUR_EMAIL in sender.lower() or 'noreply' in sender.lower():
+                    continue
+                broker_body = _gmail_text(m['payload'])
+                broker_sender = re.sub(r'<.*?>', '', sender).strip().strip('"')
+                break
+
+            full_text = subject + ' ' + broker_body
+            bl = broker_body.lower()
+
+            # Classify status from broker message
+            if broker_body:
+                if any(kw in bl for kw in ['will be showing', 'showing this', 'confirmed', 'see you at']):
+                    # Extract date/time if present
+                    dm = re.search(r'((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+|'
+                                   r'(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))',
+                                   bl, re.I)
+                    tm = re.search(r'\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b', bl, re.I)
+                    when = ' '.join(filter(None, [
+                        dm.group(0).title() if dm else '',
+                        tm.group(1).upper() if tm else '',
+                    ]))
+                    note = f"📧 {broker_sender}{' — showing ' + when if when else ' — showing confirmed'}"
+                    status = 'Tour Scheduled'
+                elif any(kw in bl for kw in ['can you view', 'available to view', 'when are you', 'move-in', 'book']):
+                    first_line = next((l.strip() for l in broker_body.splitlines() if l.strip()), '')
+                    note = f"📧 {broker_sender} — {first_line[:90]}"
+                    status = 'Tour Requested'
+                else:
+                    note = f"📧 {broker_sender} replied"
+                    status = 'Tour Requested'
+            else:
+                note = "📧 Tour request sent via StreetEasy"
+                status = 'Tour Requested'
+
+            # Match to a listing by address
+            for lid, addr in listing_addrs.items():
+                if _addr_in(addr, full_text):
+                    existing = updates.get(lid)
+                    if not existing or STATUS_RANK.get(status, 0) > STATUS_RANK.get(existing[0], 0):
+                        updates[lid] = (status, note)
+
+    return updates
+
+
 def scan_gmail_off_market(gmail_svc, listing_addrs):
     """
     Scan StreetEasy notification emails for listings that went off market.
@@ -295,95 +401,6 @@ def scan_gmail_off_market(gmail_svc, listing_addrs):
                             off_market_ids.add(lid)
 
     return off_market_ids
-
-
-def scan_gmail_tours(gmail_svc, listing_addrs):
-    """
-    Scan Gmail for broker tour signals.
-
-    listing_addrs: {listing_id: address_string}
-    Returns: {listing_id: (status, broker_note)}
-    """
-    if gmail_svc is None:
-        return {}
-
-    updates = {}
-    queries = [
-        'subject:"StreetEasy Inquiry" newer_than:90d',
-        'subject:("limited tour windows" OR "schedule your tour") newer_than:90d',
-    ]
-    seen_thread_ids = set()
-
-    for q in queries:
-        try:
-            res = gmail_svc.users().threads().list(userId='me', q=q, maxResults=50).execute()
-        except Exception as e:
-            print(f"  Gmail query failed: {e}")
-            continue
-
-        for t in res.get('threads', []):
-            if t['id'] in seen_thread_ids:
-                continue
-            seen_thread_ids.add(t['id'])
-
-            try:
-                thread = gmail_svc.users().threads().get(
-                    userId='me', id=t['id'], format='full'
-                ).execute()
-            except Exception:
-                continue
-
-            msgs = thread['messages']
-            subject = ''
-            for m in msgs:
-                for h in m['payload'].get('headers', []):
-                    if h['name'] == 'Subject' and h['value']:
-                        subject = h['value']
-
-            broker_body = ''
-            broker_sender = ''
-            for m in reversed(msgs):
-                hdrs = {h['name']: h['value'] for h in m['payload'].get('headers', [])}
-                sender = hdrs.get('From', '')
-                if YOUR_EMAIL in sender.lower() or 'noreply' in sender.lower():
-                    continue
-                broker_body = _gmail_text(m['payload'])
-                broker_sender = re.sub(r'<.*?>', '', sender).strip().strip('"')
-                break
-
-            full_text = subject + ' ' + broker_body
-            bl = broker_body.lower()
-
-            if broker_body:
-                if any(kw in bl for kw in ['will be showing', 'showing this', 'confirmed', 'see you at']):
-                    dm = re.search(r'((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+|'
-                                   r'(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))',
-                                   bl, re.I)
-                    tm = re.search(r'\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b', bl, re.I)
-                    when = ' '.join(filter(None, [
-                        dm.group(0).title() if dm else '',
-                        tm.group(1).upper() if tm else '',
-                    ]))
-                    note = f"📧 {broker_sender}{' — showing ' + when if when else ' — showing confirmed'}"
-                    status = 'Tour Scheduled'
-                elif any(kw in bl for kw in ['can you view', 'available to view', 'when are you', 'move-in', 'book']):
-                    first_line = next((l.strip() for l in broker_body.splitlines() if l.strip()), '')
-                    note = f"📧 {broker_sender} — {first_line[:90]}"
-                    status = 'Tour Requested'
-                else:
-                    note = f"📧 {broker_sender} replied"
-                    status = 'Tour Requested'
-            else:
-                note = "📧 Tour request sent via StreetEasy"
-                status = 'Tour Requested'
-
-            for lid, addr in listing_addrs.items():
-                if _addr_in(addr, full_text):
-                    existing = updates.get(lid)
-                    if not existing or STATUS_RANK.get(status, 0) > STATUS_RANK.get(existing[0], 0):
-                        updates[lid] = (status, note)
-
-    return updates
 
 
 def apply_gmail_updates(ws, gmail_updates, listing_addrs):
@@ -459,8 +476,12 @@ def fetch_listing(listing_id):
     if not bm: bm = re.search(r'\b([1-9])\s*-\s*[Bb]edroom', html)
     if bm: beds = int(bm.group(1))
 
+    # Availability: schema.org/OutOfStock covers in-contract, rented, expired
+    off_market = bool(re.search(r'schema\.org/OutOfStock', html, re.I)
+                      or re.search(r'data-testid="availableStatus"', html))
+
     return {"address": address, "neighborhood": neighborhood, "borough": borough,
-            "price": price, "beds": beds}
+            "price": price, "beds": beds, "off_market": off_market}
 
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -540,9 +561,9 @@ def apply_formatting(ws):
             "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
                       "startColumnIndex": 0, "endColumnIndex": n},
             "cell": {"userEnteredFormat": {
-                "backgroundColor": {"red": 0.882, "green": 0.902, "blue": 0.988},
+                "backgroundColor": {"red": 0.882, "green": 0.902, "blue": 0.988},  # #e1e6fc periwinkle
                 "textFormat": {"bold": True,
-                               "foregroundColor": {"red": 0.239, "green": 0.239, "blue": 0.361},
+                               "foregroundColor": {"red": 0.239, "green": 0.239, "blue": 0.361},  # dark navy
                                "fontSize": 10},
                 "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"}},
             "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"}},
@@ -572,8 +593,8 @@ def apply_formatting(ws):
             "bandedRange": {
                 "range": {"sheetId": sid, "startRowIndex": 1},
                 "rowProperties": {
-                    "firstBandColor":  {"red": 1.0,   "green": 1.0,   "blue": 1.0},
-                    "secondBandColor": {"red": 0.965, "green": 0.969, "blue": 0.996},
+                    "firstBandColor":  {"red": 1.0,   "green": 1.0,   "blue": 1.0},       # white
+                    "secondBandColor": {"red": 0.965, "green": 0.969, "blue": 0.996},      # #f6f7fd faint periwinkle
                 }}}},
         {"setDataValidation": {
             "range": {"sheetId": sid, "startRowIndex": 1,
@@ -612,6 +633,7 @@ def get_log_sheet(spreadsheet):
     except gspread.exceptions.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=LOG_TAB, rows=500, cols=len(LOG_HEADERS))
         ws.append_row(LOG_HEADERS, value_input_option="RAW")
+        # Light formatting: freeze header, periwinkle header row
         sid = ws._properties["sheetId"]
         spreadsheet.batch_update({"requests": [
             {"updateSheetProperties": {
@@ -652,10 +674,11 @@ def main():
     state = load_state()
     print(f"Last seen ROWID: {state['last_rowid']}  |  Tracked: {len(state['listings'])} listings")
 
+    # counters for run log
     added = updated = off_market_count = gmail_count = 0
     imessage_ok = True
 
-    # 1. iMessage: find new listing URLs shared by anyone in the group
+    # 1. iMessage: find new listing URLs
     raw = scan_new_messages(state["last_rowid"])
     if raw is None:
         raw = []
@@ -702,7 +725,7 @@ def main():
         added += 1
         time.sleep(3)
 
-    # 4. Refresh iMessage status on tracked listings
+    # 4. Refresh iMessage status + opinions on tracked listings
     print("\nChecking iMessage threads for updates...")
     id_to_row   = id_row_map(ws)
     status_vals = ws.col_values(HEADERS.index("Status") + 1)
@@ -711,7 +734,7 @@ def main():
         if lid not in id_to_row: continue
         row_num = id_to_row[lid]
         current = status_vals[row_num - 1] if row_num - 1 < len(status_vals) else ""
-        if STATUS_RANK.get(current, 0) >= 3: continue
+        if STATUS_RANK.get(current, 0) >= 3: continue  # skip Toured/Rejected/Passed
         new_status, _, _, _ = get_thread_data(info["guid"])
         if STATUS_RANK.get(new_status, 0) > STATUS_RANK.get(current, 0):
             print(f"  {current!r} → {new_status!r}: listing {lid}")
