@@ -256,7 +256,6 @@ def scan_gmail_tours(gmail_svc, listing_addrs):
 
     updates = {}
 
-    # Query 1: StreetEasy inquiry threads (Sam sent tour request; broker may have replied)
     queries = [
         'subject:"StreetEasy Inquiry" newer_than:90d',
         'subject:("limited tour windows" OR "schedule your tour") newer_than:90d',
@@ -284,14 +283,12 @@ def scan_gmail_tours(gmail_svc, listing_addrs):
 
             msgs = thread['messages']
 
-            # Collect subject from any message
             subject = ''
             for m in msgs:
                 for h in m['payload'].get('headers', []):
                     if h['name'] == 'Subject' and h['value']:
                         subject = h['value']
 
-            # Find the most recent broker reply (skip Sam + StreetEasy noreply)
             broker_body = ''
             broker_sender = ''
             for m in reversed(msgs):
@@ -306,10 +303,8 @@ def scan_gmail_tours(gmail_svc, listing_addrs):
             full_text = subject + ' ' + broker_body
             bl = broker_body.lower()
 
-            # Classify status from broker message
             if broker_body:
                 if any(kw in bl for kw in ['will be showing', 'showing this', 'confirmed', 'see you at']):
-                    # Extract date/time if present
                     dm = re.search(r'((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+|'
                                    r'(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))',
                                    bl, re.I)
@@ -331,7 +326,6 @@ def scan_gmail_tours(gmail_svc, listing_addrs):
                 note = "📧 Tour request sent via StreetEasy"
                 status = 'Tour Requested'
 
-            # Match to a listing by address
             for lid, addr in listing_addrs.items():
                 if _addr_in(addr, full_text):
                     existing = updates.get(lid)
@@ -387,14 +381,12 @@ def scan_gmail_off_market(gmail_svc, listing_addrs):
                 body = _gmail_text(m['payload'])
                 full_text = subject + ' ' + body
 
-                # Match by listing ID in StreetEasy URL (most reliable)
                 matched_by_url = False
                 for lid in SE_RE.findall(full_text):
                     if lid in listing_addrs:
                         off_market_ids.add(lid)
                         matched_by_url = True
 
-                # Fall back to address matching
                 if not matched_by_url:
                     for lid, addr in listing_addrs.items():
                         if _addr_in(addr, full_text):
@@ -723,6 +715,29 @@ def main():
         append_listing_row(ws, lid, item["url"], details, item["sent_at"],
                            status, "", "", "")
         added += 1
+        time.sleep(3)
+
+    # 3b. Backfill any rows that are missing address/price/beds
+    id_to_row = id_row_map(ws)
+    all_vals  = ws.get_all_values()
+    addr_idx  = HEADERS.index("Address")
+    id_idx    = HEADERS.index("ID")
+    for i, row in enumerate(all_vals):
+        if i == 0 or not (id_idx < len(row) and row[id_idx]): continue
+        if addr_idx < len(row) and row[addr_idx]: continue
+        lid = row[id_idx]
+        print(f"  Backfilling listing {lid}...")
+        details = fetch_listing(lid)
+        if not details.get("address"):
+            print("    Still unavailable — will retry next run.")
+            continue
+        hood     = details.get("neighborhood", "")
+        borough  = details.get("borough", "")
+        location = f"{hood}, {borough}" if hood and borough else hood or borough
+        print(f"    → {details['address']} | {location} | {details.get('beds')}br | ${details.get('price')}/mo")
+        ws.update(values=[[details.get("address",""), location,
+                           details.get("beds",""), details.get("price","")]],
+                  range_name=f"B{i+1}:E{i+1}")
         time.sleep(3)
 
     # 4. Refresh iMessage status + opinions on tracked listings
